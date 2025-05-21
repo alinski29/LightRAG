@@ -206,7 +206,7 @@ class PostgreSQLDB:
     async def query(
         self,
         sql: str,
-        params: dict[str, Any] | None = None,
+        params: dict[str, Any] | list[str] | None = None,
         multirows: bool = False,
         with_age: bool = False,
         graph_name: str | None = None,
@@ -221,8 +221,10 @@ class PostgreSQLDB:
                 raise ValueError("Graph name is required when with_age is True")
 
             try:
-                if params:
+                if params and isinstance(params, dict):
                     rows = await connection.fetch(sql, *params.values())
+                elif params and isinstance(params, list):
+                    rows = await connection.fetch(sql, *params)
                 else:
                     rows = await connection.fetch(sql)
 
@@ -265,8 +267,10 @@ class PostgreSQLDB:
 
                 if data is None:
                     await connection.execute(sql)  # type: ignore
-                else:
+                elif isinstance(data, dict):
                     await connection.execute(sql, *data.values())  # type: ignore
+                elif isinstance(data, list):
+                    await connection.execute(sql, *data)
         except (
             asyncpg.exceptions.UniqueViolationError,
             asyncpg.exceptions.DuplicateTableError,
@@ -653,6 +657,10 @@ class PGVectorStorage(BaseVectorStorage):
             "file_path": item.get("file_path", None),
             "create_time": current_time,
             "update_time": current_time,
+            "num_fragments": item.get("num_fragments", 0),
+            "num_llm_merges": item.get("num_llm_merges", 0),
+            "entity_type": item.get("entity_type", None),
+            "aliases": item.get("aliases", None),
         }
         return upsert_sql, data
 
@@ -666,6 +674,7 @@ class PGVectorStorage(BaseVectorStorage):
         else:
             chunk_ids = [source_id]
 
+        # workspace, id, source_id, target_id, content, content_vector, chunk_ids, file_path, create_time, update_time, keywords, num_fragments, num_llm_merges
         data: dict[str, Any] = {
             "workspace": self.db.workspace,
             "id": item["__id__"],
@@ -677,6 +686,9 @@ class PGVectorStorage(BaseVectorStorage):
             "file_path": item.get("file_path", None),
             "create_time": current_time,
             "update_time": current_time,
+            "keywords": item.get("keywords", None),
+            "num_fragments": item.get("num_fragments", 1),
+            "num_llm_merges": item.get("num_llm_merges", 0),
         }
         return upsert_sql, data
 
@@ -694,19 +706,31 @@ class PGVectorStorage(BaseVectorStorage):
             }
             for k, v in data.items()
         ]
-        contents = [v["content"] for v in data.values()]
-        batches = [
-            contents[i : i + self._max_batch_size]
-            for i in range(0, len(contents), self._max_batch_size)
-        ]
 
-        embedding_tasks = [self.embedding_func(batch) for batch in batches]
-        embeddings_list = await asyncio.gather(*embedding_tasks)
+        # Use the provided embeddings if they exist, don't recompute them
+        list_with_embeddings = []
+        list_without_embeddings = []
+        for d in list_data:
+            if "content_vector" in d and d.get("content_vector") is not None:
+                vector = d.pop("content_vector")
+                d["__vector__"] = vector
+                list_with_embeddings.append(d)
+            else:
+                list_without_embeddings.append(d)
 
-        embeddings = np.concatenate(embeddings_list)
-        for i, d in enumerate(list_data):
-            d["__vector__"] = embeddings[i]
-        for item in list_data:
+        if list_without_embeddings:
+            contents = [item["content"] for item in list_without_embeddings]
+            batches = [
+                contents[i : i + self._max_batch_size]
+                for i in range(0, len(contents), self._max_batch_size)
+            ]
+            embedding_tasks = [self.embedding_func(batch) for batch in batches]
+            embeddings_list = await asyncio.gather(*embedding_tasks)
+            embeddings = np.concatenate(embeddings_list)
+            for i, item in enumerate(list_without_embeddings):
+                item["__vector__"] = embeddings[i]
+
+        for item in list_with_embeddings + list_without_embeddings:
             if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
                 upsert_sql, data = self._upsert_chunks(item, current_time)
             elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
@@ -857,6 +881,49 @@ class PGVectorStorage(BaseVectorStorage):
         except Exception as e:
             logger.error(f"Error retrieving vector data for IDs {ids}: {e}")
             return []
+
+    # TODO: Think about using pagination or an iterator
+    async def get_all(self) -> list[dict[str, Any]]:
+        """Get all vector data from the storage
+
+        Returns:
+            List of all vector data objects
+        """
+        table_name = namespace_to_table_name(self.namespace)
+        if not table_name:
+            logger.error(f"Unknown namespace for get_all: {self.namespace}")
+            return []
+
+        query = f"SELECT *, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at FROM {table_name} WHERE workspace=$1"
+        params = {"workspace": self.db.workspace}
+
+        try:
+            results = await self.db.query(query, params, multirows=True)
+            return [dict(record) for record in results]
+        except Exception as e:
+            logger.error(f"Error retrieving all vector data: {e}")
+            return []
+
+    async def get_count(self) -> int:
+        """Get the count of vectors in the storage
+
+        Returns:
+            The number of vectors in the storage
+        """
+        table_name = namespace_to_table_name(self.namespace)
+        if not table_name:
+            logger.error(f"Unknown namespace for count: {self.namespace}")
+            return 0
+
+        query = f"SELECT COUNT(*) FROM {table_name} WHERE workspace=$1"
+        params = {"workspace": self.db.workspace}
+
+        try:
+            result = await self.db.query(query, params)
+            return result["count"] if result else 0
+        except Exception as e:
+            logger.error(f"Error retrieving vector count: {e}")
+            return -1
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage"""
@@ -1229,8 +1296,12 @@ class PGGraphStorage(BaseGraphStorage):
                     dtype = v.split("::")[-1]
                     v = v.split("::")[0]
                     if dtype == "vertex":
-                        vertex = json.loads(v)
-                        vertices[vertex["id"]] = vertex.get("properties")
+                        try:
+                            vertex = json.loads(v)
+                            vertices[vertex["id"]] = vertex.get("properties")
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse vertex string: {v}")
+                        # edges are stored as a list of dictionaries
 
         # iterate returned fields and parse appropriately
         for k in record.keys():
@@ -1252,9 +1323,15 @@ class PGGraphStorage(BaseGraphStorage):
                     dtype = v.split("::")[-1]
                     v = v.split("::")[0]
                     if dtype == "vertex":
-                        d[k] = json.loads(v)
+                        try:
+                            d[k] = json.loads(v)
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse vertex string: {v}")
                     elif dtype == "edge":
-                        d[k] = json.loads(v)
+                        try:
+                            d[k] = json.loads(v)
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse edge string: {v}")
             else:
                 d[k] = v  # Keep as string
 
@@ -2434,19 +2511,23 @@ SQL_TEMPLATES = {
                      """,
     # SQL for VectorStorage
     "upsert_entity": """INSERT INTO LIGHTRAG_VDB_ENTITY (workspace, id, entity_name, content,
-                      content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9)
+                      content_vector, chunk_ids, file_path, create_time, update_time, num_fragments, num_llm_merges, entity_type, aliases)
+                      VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9, $10, $11, $12, $13)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET entity_name=EXCLUDED.entity_name,
                       content=EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
-                      update_time=EXCLUDED.update_time
+                      update_time=EXCLUDED.update_time,
+                      num_fragments=EXCLUDED.num_fragments,
+                      num_llm_merges=EXCLUDED.num_llm_merges,
+                      entity_type=EXCLUDED.entity_type,
+                      aliases=EXCLUDED.aliases
                      """,
     "upsert_relationship": """INSERT INTO LIGHTRAG_VDB_RELATION (workspace, id, source_id,
-                      target_id, content, content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7::varchar[], $8, $9, $10)
+                      target_id, content, content_vector, chunk_ids, file_path, create_time, update_time, keywords, num_fragments, num_llm_merges)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7::varchar[], $8, $9, $10, $11, $12, $13)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET source_id=EXCLUDED.source_id,
                       target_id=EXCLUDED.target_id,
@@ -2454,7 +2535,10 @@ SQL_TEMPLATES = {
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
-                      update_time = EXCLUDED.update_time
+                      update_time = EXCLUDED.update_time,
+                      keywords=EXCLUDED.keywords,
+                      num_fragments=EXCLUDED.num_fragments,
+                      num_llm_merges=EXCLUDED.num_llm_merges
                      """,
     "relationships": """
     WITH relevant_chunks AS (
@@ -2462,7 +2546,7 @@ SQL_TEMPLATES = {
         FROM LIGHTRAG_DOC_CHUNKS
         WHERE $2::varchar[] IS NULL OR full_doc_id = ANY($2::varchar[])
     )
-    SELECT source_id as src_id, target_id as tgt_id, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at
+    SELECT source_id as src_id, target_id as tgt_id, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at, distance
     FROM (
         SELECT r.id, r.source_id, r.target_id, r.create_time, 1 - (r.content_vector <=> '[{embedding_string}]'::vector) as distance
         FROM LIGHTRAG_VDB_RELATION r
@@ -2479,7 +2563,7 @@ SQL_TEMPLATES = {
             FROM LIGHTRAG_DOC_CHUNKS
             WHERE $2::varchar[] IS NULL OR full_doc_id = ANY($2::varchar[])
         )
-        SELECT entity_name, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at FROM
+        SELECT entity_name, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at, distance FROM
             (
                 SELECT e.id, e.entity_name, e.create_time, 1 - (e.content_vector <=> '[{embedding_string}]'::vector) as distance
                 FROM LIGHTRAG_VDB_ENTITY e
@@ -2496,7 +2580,7 @@ SQL_TEMPLATES = {
             FROM LIGHTRAG_DOC_CHUNKS
             WHERE $2::varchar[] IS NULL OR full_doc_id = ANY($2::varchar[])
         )
-        SELECT id, content, file_path, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at FROM
+        SELECT id, content, file_path, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at, distance FROM
             (
                 SELECT id, content, file_path, create_time, 1 - (content_vector <=> '[{embedding_string}]'::vector) as distance
                 FROM LIGHTRAG_DOC_CHUNKS
