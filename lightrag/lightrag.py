@@ -133,6 +133,10 @@ class LightRAG:
         )
     )
 
+    # How many times to use LLM to summarize multiple fragments of descriptions before marking the description as FINAL 
+    llm_summary_limit: int = field(
+        default=get_env_value("LLM_SUMMARY_LIMIT", 3, int)
+    )
     # Text chunking
     # ---
 

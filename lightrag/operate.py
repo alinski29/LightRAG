@@ -1,41 +1,49 @@
 from __future__ import annotations
-from functools import partial
 
 import asyncio
+import datetime
 import json
-import re
 import os
+import re
+import time
+import uuid
+from collections import Counter, defaultdict, deque
+from functools import partial
 from typing import Any, AsyncIterator
-from collections import Counter, defaultdict
 
-from .utils import (
-    logger,
-    clean_str,
-    compute_mdhash_id,
-    Tokenizer,
-    is_float_regex,
-    normalize_extracted_info,
-    pack_user_ass_to_openai_messages,
-    split_string_by_multi_markers,
-    truncate_list_by_token_size,
-    process_combine_contexts,
-    compute_args_hash,
-    handle_cache,
-    save_to_cache,
-    CacheData,
-    get_conversation_turns,
-    use_llm_func_with_cache,
-)
+import numpy as np
+from dotenv import load_dotenv
+from rapidfuzz import fuzz
+import itertools
+
 from .base import (
     BaseGraphStorage,
     BaseKVStorage,
     BaseVectorStorage,
-    TextChunkSchema,
     QueryParam,
+    TextChunkSchema,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
-import time
-from dotenv import load_dotenv
+from .utils import (
+    CacheData,
+    Tokenizer,
+    clean_str,
+    compute_args_hash,
+    compute_mdhash_id,
+    get_conversation_turns,
+    handle_cache,
+    is_float_regex,
+    logger,
+    normalize_extracted_info,
+    pack_user_ass_to_openai_messages,
+    parse_jsonl_response,
+    process_combine_contexts,
+    save_to_cache,
+    split_string_by_multi_markers,
+    truncate_list_by_token_size,
+    upsert_merge_candidates,
+    use_llm_func_with_cache,
+)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -180,6 +188,13 @@ async def _handle_single_entity_extraction(
     entity_description = clean_str(record_attributes[3])
     entity_description = normalize_extracted_info(entity_description)
 
+    aliases = json.loads(record_attributes[4]) if len(record_attributes) > 4 else []
+    aliases = [
+        normalize_extracted_info(clean_str(alias.strip()), is_entity=True)
+        for alias in aliases
+        if alias.strip()
+    ]
+
     if not entity_description.strip():
         logger.warning(
             f"Entity extraction error: empty description for entity '{entity_name}' of type '{entity_type}'"
@@ -192,6 +207,7 @@ async def _handle_single_entity_extraction(
         description=entity_description,
         source_id=chunk_key,
         file_path=file_path,
+        aliases=aliases,
     )
 
 
@@ -240,9 +256,690 @@ async def _handle_single_relationship_extraction(
     )
 
 
-async def _merge_nodes_then_upsert(
+async def deduplicate_document_nodes(
+    node_data: dict[str, list[dict[str, Any]]],
+    embedding_func: callable,
+    embedding_max_batch_size: int = 32,
+) -> dict[str, dict[str, Any]]:
+    """Reduce the number of entities with the same name to a single entity
+    Args:
+        node_data: A dict of lists extracted from all chunks within the text.
+        key = entity_name
+        value: list of entities extracted from chunks, wheare each item has keys: entity_type, description, source_id, file_path, aliases
+    Returns:
+        A new dict with the deduplicated, entries, where the value is a single dict item
+    """
+    entities = dict()
+    keys = list(node_data.keys())
+    for i, entity_name in enumerate(keys):
+        entities_list = node_data[entity_name]
+        if not entities_list:
+            continue
+
+        if len(entities_list) == 1:
+            entities[entity_name] = entities_list[0]
+            continue
+
+        # Chose the entity type with the most occurrences
+        entity_type = sorted(
+            Counter([dp["entity_type"] for dp in entities_list]).items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[0][0]
+
+        descriptions = list(
+            itertools.chain.from_iterable(
+                [dp["description"].split(GRAPH_FIELD_SEP) for dp in entities_list]
+            )
+        )
+        description = (
+            sorted(descriptions, key=lambda x: len(x), reverse=True)[0]
+            if len(descriptions) > 1
+            else descriptions[0]
+        )
+        aliases = list(
+            set(itertools.chain.from_iterable([dp["aliases"] for dp in entities_list]))
+        )
+
+        entities[entity_name] = dict(
+            entity_name=entity_name,
+            entity_type=entity_type,
+            description=description,
+            source_id=GRAPH_FIELD_SEP.join(
+                set([dp["source_id"] for dp in entities_list])
+            ),
+            file_path=GRAPH_FIELD_SEP.join(
+                set([dp["file_path"] for dp in entities_list])
+            ),
+            aliases=aliases,
+        )
+
+    # contents = [
+    #     {"entity_name": v["entity_name"], "description": v["description"]}
+    #     for k, v in entities.items()
+    # ]
+
+    keys = list(entities.keys())
+    contents = [entities[key]["description"] for key in keys]
+    embedding_batches = [
+        contents[i : i + embedding_max_batch_size]
+        for i in range(0, len(contents), embedding_max_batch_size)
+    ]
+    embedding_tasks = [embedding_func(batch) for batch in embedding_batches]
+    embeddings_list = await asyncio.gather(*embedding_tasks)
+    embeddings = np.concatenate(embeddings_list)
+
+    for entity_name, vector in zip(keys, embeddings):
+        # entity_name = item["entity_name"]
+        # vector = embeddings[i]
+        entities[entity_name]["content_vector"] = vector
+
+    return entities
+
+
+async def deduplicate_document_edges(
+    edge_data: dict[tuple[str, str], list[dict[str, Any]]],
+    node_remaps: dict[str, str],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Reduce the number of edges with the same source and target to a single edge
+    Args:
+        edge_data: A dict of lists extracted from all chunks within the text.
+        key = (source, target)
+        value: list of edges extracted from chunks, wheare each item has keys: src_id, tgt_id, weight, description, keywords (str), source_id, file_path
+    Returns:
+        A new dict with the deduplicated entries, where the value is a single dict item
+    """
+    new_edges = dict()
+    for edge_key, edges in edge_data.items():
+        src_id, tgt_id = edge_key
+        new_src_id = node_remaps.get(src_id, src_id)
+        new_tgt_id = node_remaps.get(tgt_id, tgt_id)
+        new_edge_key = (new_src_id, new_tgt_id)
+
+        if not edges:
+            continue
+
+        if len(edges) == 1:
+            new_edges[new_edge_key] = edges[0]
+            continue
+
+        descriptions = list(
+            itertools.chain.from_iterable(
+                [dp["description"].split(GRAPH_FIELD_SEP) for dp in edges]
+            )
+        )
+        description = (
+            sorted(descriptions, key=lambda x: len(x), reverse=True)[0]
+            if len(descriptions) > 1
+            else descriptions[0]
+        )
+        weight = sum([dp.get("weight", 0) for dp in edges])
+
+        keywords = set()
+        # Process new keywords from edges_data
+        for edge in edges:
+            if not edge.get("keywords"):
+                continue
+            keywords.update(k.strip() for k in edge["keywords"].split(",") if k.strip())
+
+        source_id = GRAPH_FIELD_SEP.join(
+            set([dp["source_id"] for dp in edges if dp.get("source_id")])
+        )
+        file_path = GRAPH_FIELD_SEP.join(
+            set([dp["file_path"] for dp in edges if dp.get("file_path")])
+        )
+
+        new_edges[new_edge_key] = dict(
+            src_id=new_src_id,
+            tgt_id=new_tgt_id,
+            weight=weight,
+            description=description,
+            keywords=",".join(sorted(keywords)),
+            source_id=source_id,
+            file_path=file_path,
+        )
+
+    return new_edges
+
+
+def _cosine_similarity_for_trim_nodes(vec_a, vec_b):
+    if vec_a is None or vec_b is None:
+        return 0.0
+
+    vec_a_np = np.asarray(vec_a, dtype=float).flatten()
+    vec_b_np = np.asarray(vec_b, dtype=float).flatten()
+
+    if vec_a_np.size == 0 or vec_b_np.size == 0 or vec_a_np.size != vec_b_np.size:
+        return 0.0
+
+    norm_a = np.linalg.norm(vec_a_np)
+    norm_b = np.linalg.norm(vec_b_np)
+
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+
+    similarity = np.dot(vec_a_np, vec_b_np) / (norm_a * norm_b)
+    return similarity
+
+
+async def trim_document_nodes(
+    nodes: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """
+    Trim the document nodes and remove very similar nodes by merging them.
+    It compares nodes based on string similarity of names, cosine similarity of vectors,
+    and string similarity of descriptions. Prefers lowercase versions when merging.
+
+    Args:
+        nodes: A dictionary where keys are original entity names (or unique IDs if names can change)
+               and values are dictionaries containing node attributes: 'entity_name',
+               'entity_type', 'description', 'source_id', 'file_path', 'aliases', 'content_vector'.
+               The 'entity_name' in the value dict is the one to use for comparisons and merging.
+
+    Returns:
+        A tuple containing:
+            - A new dictionary with the trimmed (merged) nodes. The keys of the returned
+              dictionary will be the 'entity_name' of the chosen target nodes after merging.
+            - A dictionary mapping original entity names (of nodes that were merged away)
+              to the entity name of the target node they were merged into.
+    """
+    if not nodes:
+        return {}, {}
+
+    NAME_SIMILARITY_THRESHOLD = 0.90
+    VECTOR_SIMILARITY_THRESHOLD = 0.85
+    DESCRIPTION_SIMILARITY_THRESHOLD = 0.60
+
+    # Use original keys for graph structure, actual data from node_data_map
+    node_data_map = nodes
+    node_ids = list(node_data_map.keys())  # These are the unique IDs/original keys
+    num_nodes = len(node_ids)
+    adj = defaultdict(list)
+
+    # ADDED: Dictionary to store renames
+    node_renames = {}
+
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):
+            node_id_a = node_ids[i]
+            node_id_b = node_ids[j]
+
+            node_a_data = node_data_map[node_id_a]
+            node_b_data = node_data_map[node_id_b]
+
+            name_a = node_a_data.get("entity_name", "")
+            name_b = node_b_data.get("entity_name", "")
+
+            name_sim = fuzz.ratio(name_a.lower(), name_b.lower()) / 100.0
+
+            vec_a = node_a_data.get("content_vector")
+            vec_b = node_b_data.get("content_vector")
+            vector_sim = _cosine_similarity_for_trim_nodes(vec_a, vec_b)
+
+            desc_a = node_a_data.get("description", "") or ""
+            desc_b = node_b_data.get("description", "") or ""
+
+            if not desc_a and not desc_b:
+                desc_sim = 1.0
+            elif not desc_a or not desc_b:
+                desc_sim = 0.0
+            else:
+                desc_sim = fuzz.ratio(desc_a.lower(), desc_b.lower()) / 100.0
+
+            # Condition 1: high name or description similarity, and high vector similarity
+            condition1 = (
+                name_sim >= NAME_SIMILARITY_THRESHOLD
+                or desc_sim >= DESCRIPTION_SIMILARITY_THRESHOLD
+            ) and vector_sim >= VECTOR_SIMILARITY_THRESHOLD
+
+            # Condition 2: one name is a substring of the other, and vector similarity is high
+            substring_condition = (
+                name_a.lower() in name_b.lower() or name_b.lower() in name_a.lower()
+            )
+            condition2 = (
+                substring_condition and vector_sim >= VECTOR_SIMILARITY_THRESHOLD
+            )
+
+            # Condition 3: extremely high vector similarity
+            condition3 = vector_sim >= 0.95
+
+            if condition1 or condition2 or condition3:
+                logger.info(f"Merging nodes {node_id_a} and {node_id_b}")
+                adj[node_id_a].append(node_id_b)
+                adj[node_id_b].append(node_id_a)
+
+    trimmed_nodes_output = {}
+    visited_node_ids = set()
+
+    for i in range(num_nodes):
+        current_node_id = node_ids[i]
+        if current_node_id in visited_node_ids:
+            continue
+
+        component_node_ids = []
+        q = deque([current_node_id])
+        visited_in_component = {current_node_id}
+
+        while q:
+            id_val = q.popleft()
+            component_node_ids.append(id_val)
+            visited_node_ids.add(id_val)
+            for neighbor_id in adj[id_val]:
+                if neighbor_id not in visited_in_component:
+                    visited_in_component.add(neighbor_id)
+                    q.append(neighbor_id)
+
+        if not component_node_ids:
+            continue
+
+        if len(component_node_ids) == 1:
+            # Single node component, no merging needed
+            node_data = node_data_map[component_node_ids[0]]
+            trimmed_nodes_output[node_data["entity_name"]] = node_data
+        else:
+            # Select target node from the component
+            candidates_with_scores = []
+            for comp_node_id in component_node_ids:
+                node_data = node_data_map[comp_node_id]
+                name = node_data["entity_name"]
+                is_lower = name.islower()
+                # Check if this lowercase name has an exact uppercase/capitalized pair in the same component
+                has_case_variant_pair = False
+                if is_lower:
+                    for other_comp_id in component_node_ids:
+                        if comp_node_id == other_comp_id:
+                            continue
+                        other_name = node_data_map[other_comp_id]["entity_name"]
+                        if (
+                            other_name.lower() == name and other_name != name
+                        ):  # e.g. name="apple", other_name="Apple"
+                            has_case_variant_pair = True
+                            break
+
+                # New scoring:
+                # 1. Prioritize nodes that are NOT the lowercase part of a direct case-variant pair.
+                #    If 'apple' and 'Apple' are both in the component, 'Apple' is preferred over 'apple'.
+                #    If only 'apple' exists, or 'apple' and 'Orange', this rule doesn't penalize 'apple'.
+                #    So, if has_case_variant_pair is True, this node ('apple') gets a lower priority.
+                # 2. Prefer longer names (-len(name)).
+                # 3. If names have same length, prefer not all lowercase (is_lower: False is better).
+                # 4. Prefer longer descriptions.
+                # 5. Alphabetical by name.
+                score_tuple = (
+                    has_case_variant_pair,  # False (preferred: not a lowercase variant with an existing uppercase pair) before True
+                    -len(name),
+                    is_lower,  # False (0) for uppercase/mixed (preferred), True (1) for lowercase.
+                    -(len(node_data.get("description", "") or "")),
+                    name,
+                )
+                candidates_with_scores.append((score_tuple, comp_node_id))
+
+            # Single ascending sort is now correct with the modified score_tuple
+            candidates_with_scores.sort()
+
+            target_node_id = candidates_with_scores[0][1]
+            target_node_data_merged = dict(
+                node_data_map[target_node_id]
+            )  # Start with a copy
+            target_entity_name = target_node_data_merged["entity_name"]
+
+            # Prepare for merging attributes
+            all_descriptions = set()
+            all_source_ids = set()
+            all_file_paths = set()
+            all_aliases = set(target_node_data_merged.get("aliases", []))
+
+            for comp_node_id in component_node_ids:
+                node_to_merge_data = node_data_map[comp_node_id]
+                original_entity_name = node_to_merge_data[
+                    "entity_name"
+                ]  # Get original name before potential merge
+
+                desc = node_to_merge_data.get("description")
+                if desc:
+                    all_descriptions.update(
+                        part.strip()
+                        for part in desc.split(GRAPH_FIELD_SEP)
+                        if part.strip()
+                    )
+
+                src_id = node_to_merge_data.get("source_id")
+                if src_id:
+                    all_source_ids.update(
+                        part.strip()
+                        for part in src_id.split(GRAPH_FIELD_SEP)
+                        if part.strip()
+                    )
+
+                fp = node_to_merge_data.get("file_path")
+                if fp:
+                    all_file_paths.update(
+                        part.strip()
+                        for part in fp.split(GRAPH_FIELD_SEP)
+                        if part.strip()
+                    )
+
+                all_aliases.update(node_to_merge_data.get("aliases", []))
+                if comp_node_id != target_node_id:  # Add other entity names as aliases
+                    all_aliases.add(original_entity_name)
+                    # MODIFIED: Record the rename
+                    if original_entity_name != target_entity_name:  # only if different
+                        node_renames[original_entity_name] = target_entity_name
+
+            target_node_data_merged["description"] = GRAPH_FIELD_SEP.join(
+                sorted(list(all_descriptions))
+            )
+            target_node_data_merged["source_id"] = GRAPH_FIELD_SEP.join(
+                sorted(list(all_source_ids))
+            )
+            target_node_data_merged["file_path"] = GRAPH_FIELD_SEP.join(
+                sorted(list(all_file_paths))
+            )
+            # Ensure target's own name is not in its aliases
+            all_aliases.discard(target_node_data_merged["entity_name"])
+            target_node_data_merged["aliases"] = sorted(list(all_aliases))
+
+            trimmed_nodes_output[target_node_data_merged["entity_name"]] = (
+                target_node_data_merged
+            )
+
+    return trimmed_nodes_output, node_renames
+
+
+async def find_most_similar_entity(
     entity_name: str,
-    nodes_data: list[dict],
+    entity_data: dict[str, Any],
+    entity_vdb: BaseVectorStorage,
+    kg_db: BaseGraphStorage,
+) -> dict[str, Any] | None:
+    """
+    Find the most similar entity in the datbase
+    entity_data: a dict with keys: entity_name, entity_type, description, source_id, file_path
+
+    Returns: None if no similar entity, or a dict with keys:
+       entity_name, entity_type, description
+        string_similarity: the string similarity score
+        alias_similarity: the alias similarity score
+        cosine_similarity: the cosine similarity score
+        needs_disambiguation: True / False if the entity needs disambiguation
+    """
+    min_string_similarity = 0.90
+    min_cosine_similarity = 0.80
+    table_name = "lightrag_vdb_entity"
+    embedding_string = ",".join(map(str, entity_data["content_vector"]))
+    sql = """SELECT 
+        id AS entity_id, 
+        entity_name, 
+        entity_type,
+        content as description,
+        aliases,
+        similarity(entity_name, $1) as string_similarity,
+        COALESCE((
+            SELECT MAX(similarity(alias, $1))
+            FROM unnest(aliases) AS alias
+        ), 0) AS alias_similarity,
+        1 - (content_vector <=> '[{embedding_string}]'::vector) as vector_distance
+    FROM {table_name}
+    WHERE 
+        workspace = $2 AND (
+        similarity(entity_name, $1) >= {string_similarity_threshold}
+        OR COALESCE((
+            SELECT MAX(similarity(alias, $1))
+            FROM unnest(aliases) as alias), 0
+        ) >= {string_similarity_threshold}
+        OR (1 - (content_vector <=> '[{embedding_string}]'::vector)) >= {cosine_similarity_threshold}
+    )
+    ORDER BY string_similarity DESC, alias_similarity DESC, vector_distance DESC
+    LIMIT 10
+    """.format(
+        table_name=table_name,
+        embedding_string=embedding_string,
+        string_similarity_threshold=min_string_similarity,
+        cosine_similarity_threshold=min_cosine_similarity,
+    )
+
+    results = await entity_vdb.db.query(
+        sql,
+        params=[entity_name, entity_vdb.db.workspace],
+        multirows=True,
+    )
+
+    for item in results:
+        string_similarity = item["string_similarity"]
+        alias_similarity = item["alias_similarity"]
+        vector_distance = item["vector_distance"]
+
+        # We need to check for vector similarity: it could be an omonym
+        if string_similarity == 1.0 or alias_similarity == 1.0:
+            if vector_distance >= min_cosine_similarity:
+                logger.info(f"Found exact match with close semantic similarity: {item['entity_name']}")
+                item["needs_disambiguation"] = False
+                return item
+            else:
+                logger.info(
+                    f"Found exact match with different semantic similarity: {item['entity_name']}"
+                )
+                item["needs_disambiguation"] = True
+                return item
+
+        if (
+            max(string_similarity, alias_similarity) >= min_string_similarity
+            and vector_distance >= min_cosine_similarity
+        ):
+            item["needs_disambiguation"] = True
+            return item
+
+
+async def disambiguate_entities(
+    source_entity: dict[str, Any],
+    similar_entity: dict[str, Any],
+    llm_response_cache: BaseKVStorage,
+    llm_func: callable,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    prompt_data = []
+    for record in [source_entity, similar_entity]:
+        prompt_data.append(
+            json.dumps(
+                {
+                    "name": record["entity_name"],
+                    "description": record["description"],
+                },
+                separators=(",", ":"),
+            )
+        )
+
+    formatted_user_prompt = PROMPTS["entity_disambiguation"].replace(
+        "{data}",
+        "\n".join(prompt_data),
+    )
+
+    response = await use_llm_func_with_cache(
+        input_text=formatted_user_prompt,
+        use_llm_func=llm_func,
+        llm_response_cache=llm_response_cache,
+        cache_type="disambiguation",
+    )
+
+    parsed_response = parse_jsonl_response(response)
+
+    if not parsed_response:
+        logger.warning("Disambiguation response is empty or invalid")
+        return None, None
+
+    if len(parsed_response) == 1:
+        logger.info(
+            f"There is no disambiguation needed between {source_entity['entity_name']} and {similar_entity['entity_name']}"
+        )
+        return None, None
+
+    parsed_response[0]["initial_name"] = source_entity["entity_name"]
+    parsed_response[0]["initial_description"] = source_entity["description"]
+
+    parsed_response[1]["initial_name"] = similar_entity["entity_name"]
+    parsed_response[1]["initial_description"] = similar_entity["description"]
+
+    return parsed_response[0], parsed_response[1]
+
+
+async def process_nodes_and_edges_from_chunks(
+    chunk_results: list,
+    global_config: dict,
+    entity_vdb: BaseVectorStorage,
+    kg_db: BaseGraphStorage,
+    llm_response_cache: BaseKVStorage | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    # Collect all nodes and edges from all chunks
+    all_nodes = defaultdict(list)
+    all_edges = defaultdict(list)
+    for maybe_nodes, maybe_edges in chunk_results:
+        # Collect nodes
+        for entity_name, entities in maybe_nodes.items():
+            all_nodes[entity_name].extend(entities)
+
+        # Collect edges with sorted keys for undirected graph
+        for edge_key, edges in maybe_edges.items():
+            sorted_edge_key = tuple(sorted(edge_key))
+            all_edges[sorted_edge_key].extend(edges)
+
+    # Centralized processing of all nodes and edges
+    _deduplicated_entities = await deduplicate_document_nodes(
+        node_data=all_nodes,
+        embedding_func=global_config["embedding_func"],
+        embedding_max_batch_size=global_config.get("embedding_batch_num", 32),
+    )
+
+    trimmed_entities, node_renames = await trim_document_nodes(_deduplicated_entities)
+    key_diff = _deduplicated_entities.keys() - trimmed_entities.keys()
+    if key_diff:
+        logger.info(
+            f"Some entities in the document were trimmed do to very high similarity: {key_diff}"
+        )
+
+    doc_entities = list(trimmed_entities.keys())
+    doc_tasks = []
+    for entity in doc_entities:
+        doc_tasks.append(
+            find_most_similar_entity(
+                entity,
+                trimmed_entities[entity],
+                entity_vdb=entity_vdb,
+                kg_db=kg_db,
+            )
+        )
+    most_similar_entities = await asyncio.gather(*doc_tasks)
+    llm_func: callable = global_config["llm_model_func"]
+
+    final_nodes = {}
+    # mapping from old entity name to new entity name
+    disambig_tasks = []
+    for entity_name, similar_entity in zip(doc_entities, most_similar_entities):
+        entity_data = trimmed_entities[entity_name]
+
+        if similar_entity is None:
+            final_nodes[entity_name] = entity_data
+            continue
+
+        if not similar_entity.get("needs_disambiguation", False):
+            # No need for disambiguation
+            logger.info(
+                f"Will use similar entity: {similar_entity['entity_name']} instead of {entity_name}"
+            )
+            entity_data["description"] = similar_entity["description"]
+            entity_data["entity_name"] = similar_entity["entity_name"]
+            entity_data["entity_type"] = similar_entity["entity_type"]
+            entity_data["entity_id"] = similar_entity["entity_id"]
+            final_nodes[entity_name] = entity_data
+            continue
+
+        # disambiguate_entities
+        task = asyncio.create_task(
+            disambiguate_entities(
+                source_entity=entity_data,
+                similar_entity=similar_entity,
+                llm_response_cache=llm_response_cache,
+                llm_func=llm_func,
+            )
+        )
+        task.set_name(entity_name)
+        disambig_tasks.append(task)
+
+    if disambig_tasks:
+        disambig_results = await asyncio.gather(*disambig_tasks)
+        for task, result in zip(disambig_tasks, disambig_results):
+            entity_name = task.get_name()
+            entity_data = trimmed_entities[entity_name]
+
+            source_entity, similar_entity = result
+            if source_entity is None or similar_entity is None:
+                final_nodes[entity_name] = entity_data
+                continue
+
+            new_entity_name = source_entity["name"]
+            entity_data["description"] = source_entity["description"]
+            entity_data["entity_name"] = new_entity_name
+            final_nodes[new_entity_name] = entity_data
+            if new_entity_name != entity_name:
+                node_renames[entity_name] = new_entity_name
+
+            if similar_entity["initial_name"] != similar_entity["name"]:
+                initial_name = similar_entity["initial_name"]
+                new_name = similar_entity["name"]
+                new_description = similar_entity["description"]
+                logger.info(
+                    f"We need to update the name of {initial_name} to {new_name}"
+                )
+                ts = datetime.datetime.utcnow()
+                group_id = str(uuid.uuid4())
+                _similar_entries = [
+                    e
+                    for e in most_similar_entities
+                    if e is not None and e["entity_name"] == initial_name
+                ]
+                if not _similar_entries:
+                    logger.warning(
+                        f"Cannot find similar entries for {initial_name}, will not submit task to update name"
+                    )
+                    continue
+                _similar_entry = _similar_entries[0]
+                target_entity_id = _similar_entry["entity_id"]
+                _similar_entry_edges = await kg_db.get_node_edges(initial_name)
+                merge_candidates = [
+                    {
+                        "group_id": group_id,
+                        "target_entity_id": target_entity_id,
+                        "create_time": ts,
+                        "update_time": ts,
+                        "target_entity_type": _similar_entry["entity_type"],
+                        "target_entity_new_name": new_name,
+                        "target_entity_new_description": new_description,
+                        "rank": len(_similar_entry_edges),
+                        "merge_status": "ready_for_merge",
+                        "candidates": [
+                            {
+                                "group_id": group_id,
+                                "entity_id": target_entity_id,
+                                "rank": len(_similar_entry_edges),
+                                "entity_type": _similar_entry["entity_type"] or "technology",
+                                "merge_reasons": ["name_too_generic"],
+                                "create_time": ts,
+                            }
+                        ],
+                    }
+                ]
+                await upsert_merge_candidates(entity_vdb.db, merge_candidates)
+
+    final_edges = await deduplicate_document_edges(all_edges, node_renames)
+
+    return final_nodes, final_edges
+
+
+# TODO: I'd prefer this to be split into 2 functions, one for merging and one for upserting
+async def _merge_node_and_upsert(
+    entity_name: str,
+    # This is a dict of lists extracted from all chunks within the text.
+    # key = entity_name, the list is the list of dicts with entity_type, description, source_id, file_path
+    # nodes_data: list[dict],
+    node_data: dict[str, Any],
     knowledge_graph_inst: BaseGraphStorage,
     global_config: dict,
     pipeline_status: dict = None,
@@ -254,7 +951,11 @@ async def _merge_nodes_then_upsert(
     already_source_ids = []
     already_description = []
     already_file_paths = []
+    already_aliases = []
 
+    num_llm_merges = 0
+    # Logic for fuzzy matching, matching based on node aliases should be here
+    # most_similar_nodes = await find_most_similar_entity(
     already_node = await knowledge_graph_inst.get_node(entity_name)
     if already_node is not None:
         already_entity_types.append(already_node["entity_type"])
@@ -265,32 +966,33 @@ async def _merge_nodes_then_upsert(
             split_string_by_multi_markers(already_node["file_path"], [GRAPH_FIELD_SEP])
         )
         already_description.append(already_node["description"])
+        num_llm_merges = already_node.get("num_llm_merges", 0)
+        already_aliases = already_node.get("aliases", [])
 
-    entity_type = sorted(
-        Counter(
-            [dp["entity_type"] for dp in nodes_data] + already_entity_types
-        ).items(),
-        key=lambda x: x[1],
-        reverse=True,
-    )[0][0]
-    description = GRAPH_FIELD_SEP.join(
-        sorted(set([dp["description"] for dp in nodes_data] + already_description))
-    )
-    source_id = GRAPH_FIELD_SEP.join(
-        set([dp["source_id"] for dp in nodes_data] + already_source_ids)
-    )
-    file_path = GRAPH_FIELD_SEP.join(
-        set([dp["file_path"] for dp in nodes_data] + already_file_paths)
-    )
+    # Logic for reusing description, entity_type in case it's marked as FINAL
+    is_final = already_node.get("is_final", False) if already_node else False
+    if is_final:
+        entity_type = already_node["entity_type"]
+        description = already_node["description"]
+    else:
+        entity_name = node_data.get("entity_name", entity_name)
+        entity_type = node_data["entity_type"]
+        description = GRAPH_FIELD_SEP.join(
+            sorted(set([node_data["description"]] + already_description))
+        )
+
+    source_id = GRAPH_FIELD_SEP.join(set([node_data["source_id"]] + already_source_ids))
+    file_path = GRAPH_FIELD_SEP.join(set([node_data["file_path"]] + already_file_paths))
+    aliases = list(set(node_data.get("aliases", []) + already_aliases))
 
     force_llm_summary_on_merge = global_config["force_llm_summary_on_merge"]
-
     num_fragment = description.count(GRAPH_FIELD_SEP) + 1
-    num_new_fragment = len(set([dp["description"] for dp in nodes_data]))
-
+    num_new_fragment = len(set(node_data["description"].split(GRAPH_FIELD_SEP)))
+    has_llm_summary = False
     if num_fragment > 1:
         if num_fragment >= force_llm_summary_on_merge:
-            status_message = f"LLM merge N: {entity_name} | {num_new_fragment}+{num_fragment-num_new_fragment}"
+            # MERGE using LLM
+            status_message = f"LLM merge N: {entity_name} | {num_new_fragment}+{num_fragment - num_new_fragment}"
             logger.info(status_message)
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
@@ -304,34 +1006,52 @@ async def _merge_nodes_then_upsert(
                 pipeline_status_lock,
                 llm_response_cache,
             )
-        else:
-            status_message = f"Merge N: {entity_name} | {num_new_fragment}+{num_fragment-num_new_fragment}"
+            num_llm_merges += 1
+            has_llm_summary = True
+        elif not is_final:
+            # MERGE without LLM
+            status_message = f"Merge N: {entity_name} | {num_new_fragment}+{num_fragment - num_new_fragment}"
             logger.info(status_message)
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     pipeline_status["latest_message"] = status_message
                     pipeline_status["history_messages"].append(status_message)
 
-    node_data = dict(
+    if num_llm_merges > int(global_config.get("llm_summary_limit", 0)) and not is_final:
+        logger.info(
+            f"Marking node {entity_name} as FINAL after {num_llm_merges} merges"
+        )
+        # Mark as FINAL if LLM merge was performed
+        is_final = True
+
+    combined_node_data = dict(
         entity_id=entity_name,
         entity_type=entity_type,
         description=description,
         source_id=source_id,
         file_path=file_path,
         created_at=int(time.time()),
+        num_llm_merges=num_llm_merges,
+        num_fragments=num_fragment,
+        is_final=is_final,
+        aliases=aliases,
     )
     await knowledge_graph_inst.upsert_node(
         entity_name,
-        node_data=node_data,
+        node_data=combined_node_data,
     )
-    node_data["entity_name"] = entity_name
-    return node_data
+    combined_node_data["entity_name"] = entity_name
+    combined_node_data["content_vector"] = (
+        node_data.get("content_vector") if not has_llm_summary else None
+    )
+
+    return combined_node_data
 
 
-async def _merge_edges_then_upsert(
+async def _merge_edge_and_upsert(
     src_id: str,
     tgt_id: str,
-    edges_data: list[dict],
+    edge_data: dict[str, Any],
     knowledge_graph_inst: BaseGraphStorage,
     global_config: dict,
     pipeline_status: dict = None,
@@ -347,10 +1067,16 @@ async def _merge_edges_then_upsert(
     already_keywords = []
     already_file_paths = []
 
+    num_llm_merges = 0
+    is_final = False
+
     if await knowledge_graph_inst.has_edge(src_id, tgt_id):
         already_edge = await knowledge_graph_inst.get_edge(src_id, tgt_id)
         # Handle the case where get_edge returns None or missing fields
         if already_edge:
+            is_final = already_edge.get("is_final", False)
+            num_llm_merges += already_edge.get("num_llm_merges", 0)
+
             # Get weight with default 0.0 if missing
             already_weights.append(already_edge.get("weight", 0.0))
 
@@ -383,15 +1109,15 @@ async def _merge_edges_then_upsert(
                 )
 
     # Process edges_data with None checks
-    weight = sum([dp["weight"] for dp in edges_data] + already_weights)
-    description = GRAPH_FIELD_SEP.join(
-        sorted(
-            set(
-                [dp["description"] for dp in edges_data if dp.get("description")]
-                + already_description
-            )
+    weight = sum([edge_data["weight"]] + already_weights)
+
+    # description stays the same if is_final is true
+    if is_final and already_description:
+        description = already_description[0]
+    else:
+        description = GRAPH_FIELD_SEP.join(
+            sorted(set([edge_data["description"]] + already_description))
         )
-    )
 
     # Split all existing and new keywords into individual terms, then combine and deduplicate
     all_keywords = set()
@@ -400,26 +1126,15 @@ async def _merge_edges_then_upsert(
         if keyword_str:  # Skip empty strings
             all_keywords.update(k.strip() for k in keyword_str.split(",") if k.strip())
     # Process new keywords from edges_data
-    for edge in edges_data:
-        if edge.get("keywords"):
-            all_keywords.update(
-                k.strip() for k in edge["keywords"].split(",") if k.strip()
-            )
+    # for edge in edges_data:
+    if edge_data.get("keywords"):
+        all_keywords.update(
+            k.strip() for k in edge_data["keywords"].split(",") if k.strip()
+        )
     # Join all unique keywords with commas
     keywords = ",".join(sorted(all_keywords))
-
-    source_id = GRAPH_FIELD_SEP.join(
-        set(
-            [dp["source_id"] for dp in edges_data if dp.get("source_id")]
-            + already_source_ids
-        )
-    )
-    file_path = GRAPH_FIELD_SEP.join(
-        set(
-            [dp["file_path"] for dp in edges_data if dp.get("file_path")]
-            + already_file_paths
-        )
-    )
+    source_id = GRAPH_FIELD_SEP.join(set([edge_data["source_id"]] + already_source_ids))
+    file_path = GRAPH_FIELD_SEP.join(set([edge_data["file_path"]] + already_file_paths))
 
     for need_insert_id in [src_id, tgt_id]:
         if not (await knowledge_graph_inst.has_node(need_insert_id)):
@@ -442,19 +1157,19 @@ async def _merge_edges_then_upsert(
                     "entity_type": "UNKNOWN",
                     "file_path": file_path,
                     "created_at": int(time.time()),
+                    "is_final": False,
+                    "num_llm_merges": num_llm_merges,
+                    "num_fragments": 0,
                 },
             )
 
     force_llm_summary_on_merge = global_config["force_llm_summary_on_merge"]
-
     num_fragment = description.count(GRAPH_FIELD_SEP) + 1
-    num_new_fragment = len(
-        set([dp["description"] for dp in edges_data if dp.get("description")])
-    )
-
+    num_new_fragment = len(set(description.split(GRAPH_FIELD_SEP)))
+    has_llm_summary = False
     if num_fragment > 1:
         if num_fragment >= force_llm_summary_on_merge:
-            status_message = f"LLM merge E: {src_id} - {tgt_id} | {num_new_fragment}+{num_fragment-num_new_fragment}"
+            status_message = f"LLM merge E: {src_id} - {tgt_id} | {num_new_fragment}+{num_fragment - num_new_fragment}"
             logger.info(status_message)
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
@@ -468,13 +1183,22 @@ async def _merge_edges_then_upsert(
                 pipeline_status_lock,
                 llm_response_cache,
             )
+            num_llm_merges += 1
+            has_llm_summary = True
         else:
-            status_message = f"Merge E: {src_id} - {tgt_id} | {num_new_fragment}+{num_fragment-num_new_fragment}"
+            status_message = f"Merge E: {src_id} - {tgt_id} | {num_new_fragment}+{num_fragment - num_new_fragment}"
             logger.info(status_message)
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     pipeline_status["latest_message"] = status_message
                     pipeline_status["history_messages"].append(status_message)
+
+    if num_llm_merges > int(global_config.get("llm_summary_limit", 0)) and not is_final:
+        # Mark as FINAL if LLM merge was performed
+        logger.info(
+            f"Marking edge {src_id} -> {tgt_id} as FINAL after {num_llm_merges} merges"
+        )
+        is_final = True
 
     await knowledge_graph_inst.upsert_edge(
         src_id,
@@ -486,19 +1210,24 @@ async def _merge_edges_then_upsert(
             source_id=source_id,
             file_path=file_path,
             created_at=int(time.time()),
+            is_final=is_final,
+            num_llm_merges=num_llm_merges,
+            num_fragments=num_fragment,
         ),
     )
 
-    edge_data = dict(
+    return dict(
         src_id=src_id,
         tgt_id=tgt_id,
         description=description,
         keywords=keywords,
         source_id=source_id,
         file_path=file_path,
+        is_final=is_final,
+        num_llm_merges=num_llm_merges,
+        num_fragments=num_fragment,
+        content_vector=edge_data.get("content_vector") if not has_llm_summary else None,
     )
-
-    return edge_data
 
 
 async def merge_nodes_and_edges(
@@ -526,27 +1255,18 @@ async def merge_nodes_and_edges(
         pipeline_status_lock: Lock for pipeline status
         llm_response_cache: LLM response cache
     """
-    # Get lock manager from shared storage
     from .kg.shared_storage import get_graph_db_lock
 
-    # Collect all nodes and edges from all chunks
-    all_nodes = defaultdict(list)
-    all_edges = defaultdict(list)
+    all_nodes, all_edges = await process_nodes_and_edges_from_chunks(
+        chunk_results=chunk_results,
+        global_config=global_config,
+        entity_vdb=entity_vdb,
+        kg_db=knowledge_graph_inst,
+        llm_response_cache=llm_response_cache,
+    )
 
-    for maybe_nodes, maybe_edges in chunk_results:
-        # Collect nodes
-        for entity_name, entities in maybe_nodes.items():
-            all_nodes[entity_name].extend(entities)
-
-        # Collect edges with sorted keys for undirected graph
-        for edge_key, edges in maybe_edges.items():
-            sorted_edge_key = tuple(sorted(edge_key))
-            all_edges[sorted_edge_key].extend(edges)
-
-    # Centralized processing of all nodes and edges
     entities_data = []
     relationships_data = []
-
     # Merge nodes and edges
     # Use graph database lock to ensure atomic merges and updates
     graph_db_lock = get_graph_db_lock(enable_logging=False)
@@ -560,10 +1280,10 @@ async def merge_nodes_and_edges(
             pipeline_status["history_messages"].append(log_message)
 
         # Process and update all entities at once
-        for entity_name, entities in all_nodes.items():
-            entity_data = await _merge_nodes_then_upsert(
+        for entity_name, node_dict in all_nodes.items():
+            entity_data = await _merge_node_and_upsert(
                 entity_name,
-                entities,
+                node_dict,
                 knowledge_graph_inst,
                 global_config,
                 pipeline_status,
@@ -573,11 +1293,11 @@ async def merge_nodes_and_edges(
             entities_data.append(entity_data)
 
         # Process and update all relationships at once
-        for edge_key, edges in all_edges.items():
-            edge_data = await _merge_edges_then_upsert(
+        for edge_key, edge_dict in all_edges.items():
+            edge_data = await _merge_edge_and_upsert(
                 edge_key[0],
                 edge_key[1],
-                edges,
+                edge_dict,
                 knowledge_graph_inst,
                 global_config,
                 pipeline_status,
@@ -607,6 +1327,11 @@ async def merge_nodes_and_edges(
                     "content": f"{dp['entity_name']}\n{dp['description']}",
                     "source_id": dp["source_id"],
                     "file_path": dp.get("file_path", "unknown_source"),
+                    "is_final": dp.get("is_final", False),
+                    "num_llm_merges": dp.get("num_llm_merges", 0),
+                    "num_fragments": dp.get("num_fragments", 1),
+                    "aliases": dp.get("aliases"),
+                    "content_vector": dp.get("content_vector"),
                 }
                 for dp in entities_data
             }
@@ -624,10 +1349,14 @@ async def merge_nodes_and_edges(
                 compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
                     "src_id": dp["src_id"],
                     "tgt_id": dp["tgt_id"],
-                    "keywords": dp["keywords"],
+                    "keywords": dp["keywords"].split(","),
                     "content": f"{dp['src_id']}\t{dp['tgt_id']}\n{dp['keywords']}\n{dp['description']}",
                     "source_id": dp["source_id"],
                     "file_path": dp.get("file_path", "unknown_source"),
+                    "is_final": dp.get("is_final", False),
+                    "num_llm_merges": dp.get("num_llm_merges", 0),
+                    "num_fragments": dp.get("num_fragments", 1),
+                    "content_vector": dp.get("content_vector"),
                 }
                 for dp in relationships_data
             }
@@ -1337,26 +2066,46 @@ async def _build_query_context(
 
 
 async def _get_node_data(
-    query: str,
+    query: str | None,
     knowledge_graph_inst: BaseGraphStorage,
     entities_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
+    node_ids: list[str] = None,
+    should_fetch_chunks: bool = True,
 ):
-    # get similar entities
-    logger.info(
-        f"Query nodes: {query}, top_k: {query_param.top_k}, cosine: {entities_vdb.cosine_better_than_threshold}"
-    )
+    if query is None and node_ids is None:
+        logger.warning("No query or node_ids provided for local context")
+        return [], [], []
 
-    results = await entities_vdb.query(
-        query, top_k=query_param.top_k, ids=query_param.ids
-    )
+    if node_ids is None:
+        # get similar entities
+        logger.info(
+            f"Query nodes: {query}, top_k: {query_param.top_k}, cosine: {entities_vdb.cosine_better_than_threshold}"
+        )
 
-    if not len(results):
-        return "", "", ""
+        results = await entities_vdb.query(
+            query, top_k=query_param.top_k, ids=query_param.ids
+        )
 
-    # Extract all entity IDs from your results list
-    node_ids = [r["entity_name"] for r in results]
+        if not len(results):
+            return "", "", ""
+
+        # Extract all entity IDs from your results list
+        node_ids = [r["entity_name"] for r in results]
+    else:
+        count = (
+            -1
+            if not hasattr(entities_vdb, "get_count")
+            else await entities_vdb.get_count()
+        )
+        if hasattr(entities_vdb, "get_all") and count == len(node_ids):
+            logger.info("Fetching all nodes from entities_vdb")
+            results = await entities_vdb.get_all()
+        else:
+            results = await entities_vdb.get_by_ids(
+                ids=[compute_mdhash_id(x, "ent-") for x in node_ids]
+            )
 
     # Call the batch node retrieval and degree functions concurrently.
     nodes_dict, degrees_dict = await asyncio.gather(
@@ -1382,26 +2131,35 @@ async def _get_node_data(
         if n is not None
     ]  # what is this text_chunks_db doing.  dont remember it in airvx.  check the diagram.
     # get entitytext chunk
-    use_text_units = await _find_most_related_text_unit_from_entities(
-        node_datas,
-        query_param,
-        text_chunks_db,
-        knowledge_graph_inst,
+
+    # list[dict], fields: id, tokens, content, chunk_order_index, full_doc_id, file_path
+    # if text_chunks_db:
+    use_text_units = (
+        await _find_most_related_text_unit_from_entities(
+            node_datas,
+            query_param,
+            text_chunks_db,
+            knowledge_graph_inst,
+            truncate=(query is not None),
+        )
+        if should_fetch_chunks
+        else []
     )
+    # list[dict], fields: src_tgt: tuple(src, trg), rank, weeight, keywords: str, comma-separated, file_path, source_id, created_at (unix), description
     use_relations = await _find_most_related_edges_from_entities(
-        node_datas,
-        query_param,
-        knowledge_graph_inst,
+        node_datas, query_param, knowledge_graph_inst, truncate=(query is not None)
     )
 
-    tokenizer: Tokenizer = text_chunks_db.global_config.get("tokenizer")
     len_node_datas = len(node_datas)
-    node_datas = truncate_list_by_token_size(
-        node_datas,
-        key=lambda x: x["description"] if x["description"] is not None else "",
-        max_token_size=query_param.max_token_for_local_context,
-        tokenizer=tokenizer,
-    )
+    # Check how this works when using all entities, they could be truncated
+    if query is not None:
+        tokenizer: Tokenizer = text_chunks_db.global_config.get("tokenizer")
+        node_datas = truncate_list_by_token_size(
+            node_datas,
+            key=lambda x: x["description"] if x["description"] is not None else "",
+            max_token_size=query_param.max_token_for_local_context,
+            tokenizer=tokenizer,
+        )
     logger.debug(
         f"Truncate entities from {len_node_datas} to {len(node_datas)} (max tokens:{query_param.max_token_for_local_context})"
     )
@@ -1473,6 +2231,7 @@ async def _find_most_related_text_unit_from_entities(
     query_param: QueryParam,
     text_chunks_db: BaseKVStorage,
     knowledge_graph_inst: BaseGraphStorage,
+    truncate: bool = True,
 ):
     text_units = [
         split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
@@ -1554,16 +2313,17 @@ async def _find_most_related_text_unit_from_entities(
         logger.warning("No valid text units found")
         return []
 
-    tokenizer: Tokenizer = text_chunks_db.global_config.get("tokenizer")
     all_text_units = sorted(
         all_text_units, key=lambda x: (x["order"], -x["relation_counts"])
     )
-    all_text_units = truncate_list_by_token_size(
-        all_text_units,
-        key=lambda x: x["data"]["content"],
-        max_token_size=query_param.max_token_for_text_unit,
-        tokenizer=tokenizer,
-    )
+    if truncate:
+        tokenizer: Tokenizer = text_chunks_db.global_config.get("tokenizer")
+        all_text_units = truncate_list_by_token_size(
+            all_text_units,
+            key=lambda x: x["data"]["content"],
+            max_token_size=query_param.max_token_for_text_unit,
+            tokenizer=tokenizer,
+        )
 
     logger.debug(
         f"Truncate chunks from {len(all_text_units_lookup)} to {len(all_text_units)} (max tokens:{query_param.max_token_for_text_unit})"
@@ -1577,6 +2337,7 @@ async def _find_most_related_edges_from_entities(
     node_datas: list[dict],
     query_param: QueryParam,
     knowledge_graph_inst: BaseGraphStorage,
+    truncate: bool = True,
 ):
     node_names = [dp["entity_name"] for dp in node_datas]
     batch_edges_dict = await knowledge_graph_inst.get_nodes_edges_batch(node_names)
@@ -1626,12 +2387,13 @@ async def _find_most_related_edges_from_entities(
     all_edges_data = sorted(
         all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
     )
-    all_edges_data = truncate_list_by_token_size(
-        all_edges_data,
-        key=lambda x: x["description"] if x["description"] is not None else "",
-        max_token_size=query_param.max_token_for_global_context,
-        tokenizer=tokenizer,
-    )
+    if truncate:
+        all_edges_data = truncate_list_by_token_size(
+            all_edges_data,
+            key=lambda x: x["description"] if x["description"] is not None else "",
+            max_token_size=query_param.max_token_for_global_context,
+            tokenizer=tokenizer,
+        )
 
     logger.debug(
         f"Truncate relations from {len(all_edges)} to {len(all_edges_data)} (max tokens:{query_param.max_token_for_global_context})"
