@@ -1030,7 +1030,7 @@ class LightRAG:
 
                             # Persistent llm cache
                             if self.llm_response_cache:
-                                await self.llm_response_cache.index_done_callback
+                                await self.llm_response_cache.index_done_callback()
 
                             # Update document status to failed
                             await self.doc_status.upsert(
@@ -1110,7 +1110,7 @@ class LightRAG:
 
                             # Persistent llm cache
                             if self.llm_response_cache:
-                                await self.llm_response_cache.index_done_callback
+                                await self.llm_response_cache.index_done_callback()
 
                             # Update document status to failed
                             await self.doc_status.upsert(

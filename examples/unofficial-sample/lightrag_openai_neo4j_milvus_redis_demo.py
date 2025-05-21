@@ -1,60 +1,69 @@
 import os
 import asyncio
 from lightrag import LightRAG, QueryParam
-from lightrag.llm.openai import openai_complete_if_cache
-from lightrag.llm.siliconcloud import siliconcloud_embedding
+from lightrag.llm.ollama import ollama_embed, openai_complete_if_cache
 from lightrag.utils import EmbeddingFunc
-import numpy as np
 from lightrag.kg.shared_storage import initialize_pipeline_status
 
-WORKING_DIR = "./dickens"
-
+# WorkingDir
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKING_DIR = os.path.join(ROOT_DIR, "myKG")
 if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)
+print(f"WorkingDir: {WORKING_DIR}")
+
+# redis
+os.environ["REDIS_URI"] = "redis://localhost:6379"
+
+# neo4j
+BATCH_SIZE_NODES = 500
+BATCH_SIZE_EDGES = 100
+os.environ["NEO4J_URI"] = "neo4j://localhost:7687"
+os.environ["NEO4J_USERNAME"] = "neo4j"
+os.environ["NEO4J_PASSWORD"] = "12345678"
+
+# milvus
+os.environ["MILVUS_URI"] = "http://localhost:19530"
+os.environ["MILVUS_USER"] = "root"
+os.environ["MILVUS_PASSWORD"] = "Milvus"
+os.environ["MILVUS_DB_NAME"] = "lightrag"
 
 
 async def llm_model_func(
     prompt, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
 ) -> str:
     return await openai_complete_if_cache(
-        "Qwen/Qwen2.5-7B-Instruct",
+        "deepseek-chat",
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        api_key=os.getenv("SILICONFLOW_API_KEY"),
-        base_url="https://api.siliconflow.cn/v1/",
+        api_key="",
+        base_url="",
         **kwargs,
     )
 
 
-async def embedding_func(texts: list[str]) -> np.ndarray:
-    return await siliconcloud_embedding(
-        texts,
-        model="netease-youdao/bce-embedding-base_v1",
-        api_key=os.getenv("SILICONFLOW_API_KEY"),
-        max_token_size=512,
-    )
-
-
-# function test
-async def test_funcs():
-    result = await llm_model_func("How are you?")
-    print("llm_model_func: ", result)
-
-    result = await embedding_func(["How are you?"])
-    print("embedding_func: ", result)
-
-
-asyncio.run(test_funcs())
+embedding_func = EmbeddingFunc(
+    embedding_dim=768,
+    max_token_size=512,
+    func=lambda texts: ollama_embed(
+        texts, embed_model="shaw/dmeta-embedding-zh", host="http://117.50.173.35:11434"
+    ),
+)
 
 
 async def initialize_rag():
     rag = LightRAG(
         working_dir=WORKING_DIR,
         llm_model_func=llm_model_func,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=768, max_token_size=512, func=embedding_func
-        ),
+        llm_model_max_token_size=32768,
+        embedding_func=embedding_func,
+        chunk_token_size=512,
+        chunk_overlap_token_size=256,
+        kv_storage="RedisKVStorage",
+        graph_storage="Neo4JStorage",
+        vector_storage="MilvusVectorDBStorage",
+        doc_status_storage="RedisKVStorage",
     )
 
     await rag.initialize_storages()
