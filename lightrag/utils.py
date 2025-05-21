@@ -1,27 +1,33 @@
 from __future__ import annotations
-import weakref
 
 import asyncio
-import html
 import csv
+import datetime
+import html
 import json
 import logging
 import logging.handlers
 import os
 import re
+import weakref
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from functools import wraps
 from hashlib import md5
-from typing import Any, Protocol, Callable, TYPE_CHECKING, List
-import xml.etree.ElementTree as ET
+from typing import TYPE_CHECKING, Any, Callable, List, Protocol
+
 import numpy as np
-from lightrag.prompt import PROMPTS
 from dotenv import load_dotenv
+
 from lightrag.constants import (
-    DEFAULT_LOG_MAX_BYTES,
     DEFAULT_LOG_BACKUP_COUNT,
     DEFAULT_LOG_FILENAME,
+    DEFAULT_LOG_MAX_BYTES,
 )
+
+# Removed runtime import to avoid circular dependency; imported under TYPE_CHECKING below
+from lightrag.prompt import PROMPTS
+from lightrag.types import MergeStatus
 
 
 def get_env_value(
@@ -58,6 +64,7 @@ def get_env_value(
 # Use TYPE_CHECKING to avoid circular imports
 if TYPE_CHECKING:
     from lightrag.base import BaseKVStorage
+    from lightrag.kg.postgres_impl import PostgreSQLDB  # type: ignore
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -1521,8 +1528,7 @@ async def aexport_data(
 
     else:
         raise ValueError(
-            f"Unsupported file format: {file_format}. "
-            f"Choose from: csv, excel, md, txt"
+            f"Unsupported file format: {file_format}. Choose from: csv, excel, md, txt"
         )
     if file_format is not None:
         print(f"Data exported to: {output_path} with format: {file_format}")
@@ -1826,3 +1832,163 @@ class TokenTracker:
             f"Completion tokens: {usage['completion_tokens']}, "
             f"Total tokens: {usage['total_tokens']}"
         )
+
+
+def parse_jsonl_response(response_text: str) -> list[dict[str, Any]]:
+    """
+    Parse the entity merging response from LLM into a list of dictionaries.
+
+    The expected format of the response is a set of JSON lines (JSONL) that looks like:
+    ```json
+    {"group_name":"Jaguar (animal)","members":["Jaguar"],"description":"The jaguar is a large feline..."}
+    {"group_name":"Jaguar (car brand)","members":["Jaguar","Jaguar Mark 2"],"description":"Jaguar is a British luxury..."}
+    ```
+    """
+    try:
+        result = []
+        json_match = re.search(r"```(?:json)?\n(.*?)\n```", response_text, re.DOTALL)
+        if json_match:
+            json_content = json_match.group(1)
+        else:
+            json_content = response_text
+
+        # Split by newlines and parse each line as a JSON object
+        json_lines = [
+            line.strip()
+            for line in json_content.split("\n")
+            if line.strip() and not line.strip().startswith("```")
+        ]
+
+        for line in json_lines:
+            try:
+                parsed_obj = json.loads(line)
+                if isinstance(parsed_obj, dict):
+                    result.append(parsed_obj)
+            except json.JSONDecodeError:
+                continue
+        return result
+    except Exception as e:
+        logger.error(f"Failed to parse entity merging response: {e}")
+        return []
+
+
+async def upsert_merge_candidates(
+    db: "PostgreSQLDB",
+    merge_candidates: list[dict[str, Any]],
+):
+    """
+    Save merge candidates to the Postgres database using the PGVectorStorage database object.
+    Args:
+        rag: LightRAG instance (must have .entities_vdb.db as PostgreSQLDB)
+        merge_candidates: List of group dicts as produced by prepare_cluster_entries/merge pipeline
+    """
+    if db is None:
+        raise RuntimeError("No database connection found in rag.entities_vdb.db")
+
+    for group in merge_candidates:
+        workspace = db.workspace
+        target_entity_id = group["target_entity_id"]
+        merge_strategy = group.get("merge_strategy")
+        if merge_strategy is None:
+            merge_strategy_db = None
+        elif isinstance(merge_strategy, str):
+            merge_strategy_db = merge_strategy
+        else:
+            merge_strategy_db = json.dumps(merge_strategy)
+        merge_status = group.get("merge_status", MergeStatus.IN_REVIEW.name).lower()
+        create_time = group.get("create_time") or datetime.datetime.utcnow()
+        update_time = group.get("update_time") or create_time
+        merged_by = group.get("merged_by")
+        reviewer_comments = group.get("reviewer_comments")
+
+        try:
+            query = "SELECT group_id from lightrag_entity_merge_group WHERE workspace=$1 AND target_entity_id=$2"
+            row = await db.query(
+                query,
+                params={"workspace": workspace, "target_entity_id": target_entity_id},
+            )
+            group_id = None if row is None else row.get("group_id")
+        except Exception as e:
+            logger.error(
+                f"Error retrieving group_id for {target_entity_id}, {workspace} : {e}"
+            )
+            group_id = group["group_id"]
+
+        if group_id is None:
+            logger.error(
+                f"Group ID not found for target entity {target_entity_id} in workspace {workspace}, inserting: {group['group_id']}"
+            )
+            group_id = group["group_id"]
+        else:
+            logger.info(
+                f"Group ID found for target entity {target_entity_id} in workspace {workspace}, using: {group_id}"
+            )
+
+        # Insert into lightrag_entity_merge_group
+        sql_group = """
+            INSERT INTO lightrag_entity_merge_group (
+                workspace, group_id, target_entity_id, merge_strategy, merge_status, create_time, update_time, merged_by, reviewer_comments,
+                target_entity_new_name, target_entity_new_description
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            )
+            ON CONFLICT (workspace, target_entity_id) DO UPDATE SET
+                merge_strategy=EXCLUDED.merge_strategy,
+                merge_status=EXCLUDED.merge_status,
+                update_time=EXCLUDED.update_time,
+                merged_by=EXCLUDED.merged_by,
+                reviewer_comments=EXCLUDED.reviewer_comments,
+                target_entity_new_name=EXCLUDED.target_entity_new_name,
+                target_entity_new_description=EXCLUDED.target_entity_new_description
+        """
+        params_group = {
+            "workspace": workspace,
+            "group_id": group_id,
+            "target_entity_id": target_entity_id,
+            "merge_strategy": merge_strategy_db,
+            "merge_status": merge_status,
+            "create_time": create_time,
+            "update_time": update_time,
+            "merged_by": merged_by,
+            "reviewer_comments": reviewer_comments,
+            "target_entity_new_name": group.get("target_entity_new_name"),
+            "target_entity_new_description": group.get("target_entity_new_description"),
+        }
+        await db.execute(sql_group, params_group)
+
+        # Insert candidates for this group
+        for cand in group.get("candidates", []):
+            candidate_entity_id = cand["entity_id"]
+            string_similarity = cand.get("string_similarity")
+            cosine_similarity = cand.get("cosine_similarity")
+            candidate_rank = cand.get("rank")
+            candidate_type = cand.get("entity_type")
+            merge_reasons = [r.lower() for r in cand.get("merge_reasons", [])]
+            cand_create_time = cand.get("create_time") or create_time
+
+            sql_cand = """
+                INSERT INTO lightrag_entity_merge_candidate (
+                    group_id, workspace, candidate_entity_id, string_similarity, cosine_similarity, candidate_rank, candidate_type, merge_reasons, create_time
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9
+                )
+                ON CONFLICT (group_id, workspace, candidate_entity_id) DO UPDATE SET
+                    string_similarity=EXCLUDED.string_similarity,
+                    cosine_similarity=EXCLUDED.cosine_similarity,
+                    candidate_rank=EXCLUDED.candidate_rank,
+                    candidate_type=EXCLUDED.candidate_type,
+                    merge_reasons=EXCLUDED.merge_reasons,
+                    create_time=EXCLUDED.create_time
+            """
+            params_cand = {
+                "group_id": group_id,
+                "workspace": workspace,
+                "candidate_entity_id": candidate_entity_id,
+                "string_similarity": string_similarity,
+                "cosine_similarity": cosine_similarity,
+                "candidate_rank": candidate_rank,
+                "candidate_type": candidate_type,
+                "merge_reasons": [r.lower() for r in merge_reasons],
+                "create_time": cand_create_time,
+            }
+            await db.execute(sql_cand, params_cand)

@@ -258,6 +258,8 @@ async def aedit_entity(
                             "description": description,
                             "keywords": keywords,
                             "weight": weight,
+                            "num_fragments": description.count(GRAPH_FIELD_SEP) + 1,
+                            # "num_llm_merges": edge_data.get("num_llm_merges", 0) + 1,
                         }
                     }
 
@@ -289,6 +291,9 @@ async def aedit_entity(
                     "source_id": source_id,
                     "description": description,
                     "entity_type": entity_type,
+                    "num_fragments": description.count(GRAPH_FIELD_SEP) + 1,
+                    # "num_llm_merges": entity.get("num_llm_merges", 0) + 1,
+                    # TODO: Add other fields, like aliases
                 }
             }
 
@@ -816,6 +821,7 @@ async def amerge_entities(
                     "source_id": source_id,
                     "description": description,
                     "entity_type": entity_type,
+                    "num_fragments": description.count(GRAPH_FIELD_SEP) + 1,
                 }
             }
 
@@ -842,8 +848,9 @@ async def amerge_entities(
                         "tgt_id": tgt,
                         "source_id": source_id,
                         "description": description,
-                        "keywords": keywords,
+                        "keywords": keywords.split(","),
                         "weight": weight,
+                        "num_fragments": description.count(GRAPH_FIELD_SEP) + 1,
                     }
                 }
 
